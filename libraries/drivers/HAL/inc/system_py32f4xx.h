@@ -73,7 +73,9 @@
   */
 // extern uint32_t SystemCoreClock;          /*!< System Clock Frequency (Core Clock) */
 
-extern uint32_t system_core_clock;          
+// 修复：与 CMSIS device_support/system_at32f403a_407.h 的 `extern unsigned int` 对齐。
+// 在 GCC/newlib 下 uint32_t 是 unsigned long，与 unsigned int 类型冲突会报硬错误。
+extern unsigned int system_core_clock;
 #define SystemCoreClock system_core_clock
 
 extern const uint8_t  AHBPrescTable[16];    /*!< AHB prescalers table values */

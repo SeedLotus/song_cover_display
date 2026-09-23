@@ -31,3 +31,6 @@ JLinkLog.txt
 *.sct
 *.hex
 *.bin
+
+# GCC build output
+build/
