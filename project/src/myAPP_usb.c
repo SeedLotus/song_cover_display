@@ -60,13 +60,14 @@ uint16_t pack_get_first_lost_index(void){
 // 获取丢包数
 uint16_t pack_get_lost_counter(void){
     uint16_t lost_counter = 0;
-    for(uint8_t i; i < 59; i ++){
-        if(pic_buf_pack_counter[i] != 0xFFFFFFFF){
-            for(uint8_t j = 0; j < 32; j ++){
-                if(pic_buf_pack_counter[i] & (1U << j)){
-                    lost_counter ++;
-                }
-            }
+    // 修复：循环变量 i 原来未初始化（未定义行为，导致首次传输误报丢包）
+    for(uint8_t i = 0; i < 59; i ++){
+        // 修复：直接统计缺失的位。原实现统计的是不完整字中"已收到"的位，
+        // 整字 32 包全丢时该字为 0、贡献 0，会漏判为无丢包。
+        uint32_t missing = ~pic_buf_pack_counter[i];
+        while(missing){
+            lost_counter += missing & 1U;
+            missing >>= 1;
         }
     }
 
@@ -137,6 +138,40 @@ uint8_t usbd_rx_buffer1[64] = {0, 0, 0};
 uint8_t *usb_rx_buffers[] = {cdc_struct.g_rx_buff, usbd_rx_buffer1};
 uint8_t usb_rx_buffer_now = 0;
 uint8_t *usb_rx_buffer_p_now = cdc_struct.g_rx_buff;
+
+// 待重发命令缓存（单槽位）：TX 忙时命令先存这里，下个任务周期重试，
+// 避免 /a、/k 等关键回包被静默丢弃导致上位机超时误判
+static uint8_t usb_tx_pending_buf[8];
+static uint8_t usb_tx_pending_len = 0;
+
+// 发送命令回包；TX 忙时存入待重发缓存（新命令覆盖旧命令，/q0 /q1 自身有周期重发，无需走这里）
+static void usb_cmd_send(const uint8_t *cmd, uint8_t len){
+    if(cdc_struct.g_tx_completed){
+        cdc_struct.g_tx_completed = 0;
+        for(uint8_t i = 0; i < len; i ++){
+            usb_tx_buf0[i] = cmd[i];
+        }
+        usbd_ept_send(&usb_core_dev, USBD_CDC_BULK_IN_EPT, usb_tx_buf0, len);
+        usb_tx_pending_len = 0;
+    }else {
+        for(uint8_t i = 0; i < len; i ++){
+            usb_tx_pending_buf[i] = cmd[i];
+        }
+        usb_tx_pending_len = len;
+    }
+}
+
+// 在任务周期开头调用：重试上一周期因 TX 忙未能发出的命令
+static void usb_cmd_pending_retry(void){
+    if(usb_tx_pending_len && cdc_struct.g_tx_completed){
+        cdc_struct.g_tx_completed = 0;
+        for(uint8_t i = 0; i < usb_tx_pending_len; i ++){
+            usb_tx_buf0[i] = usb_tx_pending_buf[i];
+        }
+        usbd_ept_send(&usb_core_dev, USBD_CDC_BULK_IN_EPT, usb_tx_buf0, usb_tx_pending_len);
+        usb_tx_pending_len = 0;
+    }
+}
 // uint8_t *flag_usb_rx_cplt = &cdc_struct.g_rx_completed;
 // 在 usb 中断回调里直接置 1 usb 接收任务运行标志位，主循环一旦空闲立即运行读取任务而无需 1ms 后轮询
 uint8_t *flag_usb_task_run = &task_usb_get.topic.flag;
@@ -150,6 +185,9 @@ void task_func_usb_get(void *param){
     uint16_t pic_update_index;
     uint16_t first_lost_pack_index;
     // static uint32_t counter_get_times = 0;
+
+    // 优先重试因 TX 忙未发出的命令回包
+    usb_cmd_pending_retry();
 
     if(cdc_struct.g_rx_completed){
         cdc_struct.g_rx_completed = 0;
@@ -195,17 +233,13 @@ void task_func_usb_get(void *param){
                         // 重置丢包计数
                         pack_counter_reset();
 
-                        // 发送准备 ok 命令
-                        if(cdc_struct.g_tx_completed){
-                            cdc_struct.g_tx_completed = 0;
-                            usb_tx_buf0[0] = '/';
-                            usb_tx_buf0[1] = 'k';
-                            usb_tx_buf0[2] = '\n';
-                            usb_tx_buf0[3] = '\0';
-                            usbd_ept_send(&usb_core_dev, USBD_CDC_BULK_IN_EPT, usb_tx_buf0, 4);
-                        }else { // 正在忙于发送其他数据
-                            // 先不管，等上位机重新要求
-                        }
+                        // 发送准备 ok 命令（TX 忙时自动转入待重发缓存）
+                        usb_cmd_send((const uint8_t *)"/k\n", 4);
+
+                        break;
+
+                    case 'h': // 心跳：仅重置休眠计时，不改变播放状态机与显示
+                        _usb_get_up();
 
                         break;
                         
@@ -217,49 +251,22 @@ void task_func_usb_get(void *param){
                             disp_pic_down();
                             flag_in_rx_pic = 0;
 
-                            // 发送接收完毕消息
-                            if(cdc_struct.g_tx_completed){
-                                cdc_struct.g_tx_completed = 0;
-                                usb_tx_buf0[0] = '/';
-                                usb_tx_buf0[1] = 'a';
-                                usb_tx_buf0[2] = '\n';
-                                usb_tx_buf0[3] = '\0';
-                                usbd_ept_send(&usb_core_dev, USBD_CDC_BULK_IN_EPT, usb_tx_buf0, 4);
-                            }else { // 正在忙于发送其他数据
-                                // 
-                            }
+                            // 发送接收完毕消息（TX 忙时自动转入待重发缓存，不再静默丢弃）
+                            usb_cmd_send((const uint8_t *)"/a\n", 4);
 
                             break;
                         }
                         // 有丢包
                         first_lost_pack_index = pack_get_first_lost_index();
+                        uint8_t cmd_retry[6] = {'/', 0, (uint8_t)(first_lost_pack_index>>8),
+                                                (uint8_t)(first_lost_pack_index & 0xFF), '\n', '\0'};
                         if(pack_lost_counter < 10){ // 丢包数量较小，挨个请求
-                            if(cdc_struct.g_tx_completed){
-                                cdc_struct.g_tx_completed = 0;
-                                usb_tx_buf0[0] = '/';
-                                usb_tx_buf0[1] = 'r';
-                                usb_tx_buf0[2] = (first_lost_pack_index>>8);
-                                usb_tx_buf0[3] = first_lost_pack_index & 0xFF;
-                                usb_tx_buf0[4] = '\n';
-                                usb_tx_buf0[5] = '\0';
-                                usbd_ept_send(&usb_core_dev, USBD_CDC_BULK_IN_EPT, usb_tx_buf0, 6);
-                            }else { // 正在忙于发送其他数据
-                                // 
-                            }
+                            cmd_retry[1] = 'r';
                         }else { // 丢包数量较大，要求从第一个丢包处开始重发图片
-                            if(cdc_struct.g_tx_completed){
-                                cdc_struct.g_tx_completed = 0;
-                                usb_tx_buf0[0] = '/';
-                                usb_tx_buf0[1] = 'x';
-                                usb_tx_buf0[2] = (first_lost_pack_index>>8);
-                                usb_tx_buf0[3] = first_lost_pack_index & 0xFF;
-                                usb_tx_buf0[4] = '\n';
-                                usb_tx_buf0[5] = '\0';
-                                usbd_ept_send(&usb_core_dev, USBD_CDC_BULK_IN_EPT, usb_tx_buf0, 6);
-                            }else { // 正在忙于发送其他数据
-                                // 
-                            }
+                            cmd_retry[1] = 'x';
                         }
+                        // TX 忙时自动转入待重发缓存
+                        usb_cmd_send(cmd_retry, 6);
 
                         break;
 
@@ -276,7 +283,8 @@ void task_func_usb_get(void *param){
                 // 计算索引
                 // pic_update_index = ((uint16_t)usb_rx_buffers[buffer_index][1] << 8) | usb_rx_buffers[buffer_index][2];
                 pic_update_index = ((uint16_t)usb_rx_buffer_p_now[1] << 8) | usb_rx_buffer_p_now[2];
-                if(pic_update_index > PIC_PACK_NUMS){
+                // 修复：原来用 >，放行 index==1888 导致越界写 29 字节；合法序号范围是 0~1887
+                if(pic_update_index >= PIC_PACK_NUMS){
                     break;
                 }
                 // 复制数据
@@ -286,6 +294,9 @@ void task_func_usb_get(void *param){
 
                 // 统计包
                 pack_count_in(pic_update_index);
+
+                // 收图也算上位机活动，重置休眠计时，避免长传输期间倒计时归零休眠
+                _usb_get_up();
 
                 // LOG_FMT("Get pic:%d\n", pic_update_index);
                 break;
