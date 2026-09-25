@@ -178,6 +178,10 @@ uint8_t *flag_usb_task_run = &task_usb_get.topic.flag;
 
 void task_func_usb_get(void *param){
     static uint8_t flag_in_rx_pic = 0;
+    // 播放状态跟踪（v2 协议：/1 /0 幂等设态的状态判据）
+    // 初值 0 = 暂停，与设备上电默认状态（摇臂抬起、不旋转）一致；
+    // topic_player_pause/resume 仅由 /0 /1 发布，手动拨臂经上位机中转最终也回到这两个命令，因此该变量与现实一致
+    static uint8_t usb_player_playing = 0;
     uint16_t pack_lost_counter;
 
     uint16_t length;
@@ -208,16 +212,29 @@ void task_func_usb_get(void *param){
                 // LOG_FMT("Get cmd:%s\n", usb_rx_buffers[buffer_index]);
                 // switch(usb_rx_buffers[buffer_index][1]){
                 switch(usb_rx_buffer_p_now[1]){
-                    case '0': // 暂停播放
-                        ltx_Topic_publish(&topic_player_pause);
+                    case '0': // 暂停播放（幂等设态：仅状态翻转时驱动摇臂脚本，重复 /0 无副作用）
+                        if(usb_player_playing){
+                            usb_player_playing = 0;
+                            ltx_Topic_publish(&topic_player_pause);
+                        }
                         disp_pic_rotate(0);
                         _usb_get_up();
 
                         break;
 
-                    case '1': // 继续播放
-                        ltx_Topic_publish(&topic_player_resume);
+                    case '1': // 继续播放（幂等设态：仅状态翻转时驱动摇臂脚本；
+                              // disp_pic_rotate(1) 显示侧幂等，重复调用用于封面传输后恢复转动）
+                        if(!usb_player_playing){
+                            usb_player_playing = 1;
+                            ltx_Topic_publish(&topic_player_resume);
+                        }
                         disp_pic_rotate(1);
+                        _usb_get_up();
+
+                        break;
+
+                    case 'v': // 协议版本查询：v2 = 支持幂等设态播放命令（/1 /0 不再翻转摇臂）
+                        usb_cmd_send((const uint8_t *)"/v2\n", 5);
                         _usb_get_up();
 
                         break;
