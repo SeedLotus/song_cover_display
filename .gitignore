@@ -34,3 +34,4 @@ JLinkLog.txt
 
 # GCC build output
 build/
+build_log.txt
